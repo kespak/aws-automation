@@ -1,0 +1,8 @@
+{
+  "export_to_s3_epoc": {
+    "S": "1583441042284"
+  },
+  "log_group": {
+    "S": "loggroup_filter"
+  }
+}
