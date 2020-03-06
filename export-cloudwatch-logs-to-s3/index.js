@@ -1,21 +1,62 @@
 const AWS = require('aws-sdk');
 let cloudwatchLogsInstance = {};
 let s3Instance = {};
+let ddbOutput;
 let __region = '';
-
+​
 function setRegion(_region) {
     __region = _region;
 }
-
+​
 function setInstance(_region) {
     cloudwatchLogsInstance = new AWS.CloudWatchLogs({ region: __region });
     s3Instance = new AWS.S3({ region: __region });
 }
-
+​
 function getS3Buckets() {
     return s3Instance.listBuckets({}).promise();
 }
-
+​
+function writeDatetimeToDynamoDB(ddb, UTCdatetime, logGroupFilter) {
+    const params = {
+      TableName: 'cw-to-s3-tracking',
+      Item: {
+        log_group : {
+              S: logGroupFilter
+            },
+        export_to_s3_epoc : {
+              S: `${UTCdatetime}`
+            },
+      }
+    };
+    ddb.putItem(params, function(err, data) {
+          if (err) {
+            console.log("Error", err);
+          } else {
+            console.log("Success. DynamoDB updated", data);
+          }
+    });
+}
+​
+function getDatetimeFromDynamoDB(ddb, logGroupFilter) {
+    var params = {
+        TableName: 'cw-to-s3-tracking',
+        Key: {
+            log_group : {
+                S: logGroupFilter }
+                }
+    };       
+    ddb.getItem(params, function(err, data) {
+      if (err) {
+        console.log("Error", err);
+      } else {
+        ddbOutput = data.Item.export_to_s3_epoc.S;
+      }
+    });
+​
+    return ddbOutput;
+}
+​
 async function isS3BucketExists(bucketName) {
     try {
         const bucketsObject = await getS3Buckets();
@@ -30,7 +71,7 @@ async function isS3BucketExists(bucketName) {
         console.error(err);
     }
 }
-
+​
 async function createS3BucketAndPutPolicy(bucketName) {
     try {
         const _isS3BucketExist = await isS3BucketExists(bucketName);
@@ -73,36 +114,36 @@ async function createS3BucketAndPutPolicy(bucketName) {
         console.error(err);
     }
 }
-
+​
 function getDatePath(dateObj) {
     const year = dateObj.getFullYear();
     const month = dateObj.getMonth() + 1;
     const date = dateObj.getDate();
     return `${year}/${month}/${date}`;
 }
-
+​
 function getLogPathForS3(logGroupName) {
     if (logGroupName.startsWith('/')) {
         logGroupName = logGroupName.slice(1);
     }
     return logGroupName.replace(/\//g, '-');
 }
-
+​
 function wait(timeout) {
     return new Promise((resolve) => {
         setTimeout(() => {
-            resolve()
-        }, timeout)
-    })
+            resolve();
+        }, timeout);
+    });
 }
-
+​
 function describeExportTask(taskId) {
     let params = {
         taskId: taskId
     };
     return cloudwatchLogsInstance.describeExportTasks(params).promise();
 }
-
+​
 let waitErrorCount = 0;
 async function waitForExportTaskToComplete(taskId) {
     try {
@@ -123,27 +164,30 @@ async function waitForExportTaskToComplete(taskId) {
         throw error;
     }
 }
-
-async function exportToS3Task(s3BucketName, logGroupName, logFolderName) {
+​
+async function exportToS3Task(s3BucketName, logGroupName, logFolderName, exportFrom, exportTo) {
     try {
         const logPathForS3 = getLogPathForS3(logGroupName);
-        const today = new Date();
-        const yesterday = new Date();
-        yesterday.setDate(today.getDate() - 1);
+        console.log("Export params: ");
+        console.log("From: ", exportFrom);
+        console.log("To: ", exportTo);
+        console.log("Log group name: ", logGroupName);
+        
         const params = {
             destination: s3BucketName,
-            destinationPrefix: `${logFolderName}/${logPathForS3}/${getDatePath(new Date())}`,
-            from: yesterday.getTime(),
+            destinationPrefix: `${logFolderName}/${logPathForS3}`,
+            from: exportFrom,
             logGroupName: logGroupName,
-            to: today.getTime()
+            to: exportTo
         };
         const response = await cloudwatchLogsInstance.createExportTask(params).promise();
+        console.log("Export task ID: ", response.taskId);
         await waitForExportTaskToComplete(response.taskId);
     } catch (error) {
         throw error;
     }
 }
-
+​
 function getCloudWatchLogGroups(nextToken, limit) {
     const params = {
         nextToken: nextToken,
@@ -151,13 +195,22 @@ function getCloudWatchLogGroups(nextToken, limit) {
     };
     return cloudwatchLogsInstance.describeLogGroups(params).promise();
 }
-
+​
 exports.handler = async (event) => {
+    const ddb = new AWS.DynamoDB({apiVersion: '2012-08-10'});
+    
     const region = event.region;
     const s3BucketName = event.s3BucketName;
     const logFolderName = event.logFolderName;
     const nextToken = event.nextToken;
     const logGroupFilter = event.logGroupFilter;
+    
+    var exportTo = new Date();
+    exportTo.setHours(exportTo.getHours() - 12); 
+    exportTo = exportTo.getTime();
+    
+    const exportFrom = getDatetimeFromDynamoDB(ddb, logGroupFilter);
+    
     try {
         setRegion(region);
         setInstance();
@@ -173,8 +226,9 @@ exports.handler = async (event) => {
             // Ignore log group
             return event;
         }
-        await exportToS3Task(s3BucketName, logGroupName, logFolderName);
+        await exportToS3Task(s3BucketName, logGroupName, logFolderName, exportFrom, exportTo);
         console.log("Successfully created export task for ", logGroupName);
+        await writeDatetimeToDynamoDB(ddb, exportTo, logGroupFilter);
         return event;
     } catch (error) {
         console.error(error);
